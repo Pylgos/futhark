@@ -168,7 +168,10 @@ proc sanitizeName(usedNames: var HashSet[string], origName: string, kind: string
       result = "compiler_" & result[2..^1]
     else:
       result = "internal_" & result[1..^1]
-  result = result.nimIdentNormalize()
+  if result.startsWith("!"):
+    result.removePrefix("!")
+  else:
+    result = result.nimIdentNormalize()
   var renamed = false
   if usedNames.contains(result) or result in builtins:
     result.add kind
