@@ -158,8 +158,18 @@ type
     extraTypes: NimNode
     renameCallback: RenameCallback
     forwards: seq[Forward]
+    keepCase: bool
 
-proc sanitizeName(usedNames: var HashSet[string], origName: string, kind: string, renameCallback: RenameCallback, partof = ""): string {.compileTime.} =
+proc toValidNimIdent(s: string): string =
+  result = s
+  while result.startsWith("_"):
+    result.removePrefix("_")
+  while result.endsWith("_"):
+    result.removeSuffix("_")
+  while result.contains("__"):
+    result = result.replace("__", "_")
+
+proc sanitizeName(usedNames: var HashSet[string], origName: string, kind: string, renameCallback: RenameCallback, partof = "", keepCase = false): string {.compileTime.} =
   result = origName
   if not renameCallback.isNil:
     result = result.renameCallback(kind, partof)
@@ -168,7 +178,10 @@ proc sanitizeName(usedNames: var HashSet[string], origName: string, kind: string
       result = "compiler_" & result[2..^1]
     else:
       result = "internal_" & result[1..^1]
-  result = result.nimIdentNormalize()
+  if keepCase:
+    result = result.toValidNimIdent()
+  else:
+    result = result.nimIdentNormalize()
   var renamed = false
   if usedNames.contains(result) or result in builtins:
     result.add kind
@@ -182,7 +195,7 @@ proc sanitizeName(usedNames: var HashSet[string], origName: string, kind: string
 
 proc sanitizeName(state: var State, origName: string, kind: string): string {.compileTime.} =
   if not state.renamed.hasKey(origName):
-    result = sanitizeName(state.usedNames, origName, kind, state.renameCallback)
+    result = sanitizeName(state.usedNames, origName, kind, state.renameCallback, "", state.keepCase)
     state.renamed[origName] = result
   else:
     result = state.renamed[origName]
@@ -292,7 +305,7 @@ proc toNimType(json: JsonNode, state: var State): NimNode =
         usedFields: HashSet[string]
       for arg in json["arguments"]:
         let
-          aname = if arg.hasKey("name"): usedFields.sanitizeName(arg["name"].str, "arg", state.renameCallback) else: "a" & $i
+          aname = if arg.hasKey("name"): usedFields.sanitizeName(arg["name"].str, "arg", state.renameCallback, "", state.keepCase) else: "a" & $i
           atype = (if arg.hasKey("type"): arg["type"] else: arg).toNimType(state)
         if arg.hasKey("type"):
           if arg["type"]["kind"].str == "pointer" and arg["type"]["base"]["kind"].str == "alias":
@@ -400,14 +413,14 @@ proc createStruct(origName, saneName: string, node: JsonNode, state: var State, 
     let (saneFieldName, fname) =
       if field.hasKey("name"):
         let
-          saneFieldName = usedFieldNames.sanitizeName(field["name"].str, "field", state.renameCallback, partof = saneName)
+          saneFieldName = usedFieldNames.sanitizeName(field["name"].str, "field", state.renameCallback, partof = saneName, keepCase = state.keepCase)
           fname =
             if state.fieldRenames.hasKey(origName):
               state.fieldRenames[origName].getOrDefault(field["name"].str, saneFieldName)
             else: saneFieldName
         (saneFieldName, fname)
       else:
-        let name = usedFieldNames.sanitizeName("anon" & $anons, "field", state.renameCallback, partof = saneName)
+        let name = usedFieldNames.sanitizeName("anon" & $anons, "field", state.renameCallback, partof = saneName, keepCase = state.keepCase)
         inc anons
         (name, name)
     let fident =
@@ -578,6 +591,7 @@ macro importc*(imports: varargs[untyped]): untyped =
     opircallbacks = nnkPrefix.newTree(newIdentNode("@"), nnkBracket.newTree())
     forwards = nnkPrefix.newTree(newIdentNode("@"), nnkBracket.newTree())
     sysPathDefined = false
+    keepCase = false
   for node in nodes:
     case node.kind:
     of nnkStrLit:
@@ -619,6 +633,8 @@ macro importc*(imports: varargs[untyped]): untyped =
         for extra in 2..<node.len:
           extras[1].add newLit(node[extra].repr)
         forwards[1].add nnkObjConstr.newTree(bindSym("Forward"), nnkExprColonExpr.newTree("name".ident, node[1]), nnkExprColonExpr.newTree("extraPragmas".ident, extras))
+      of "keepcase":
+        keepCase = true
       else:
         let toImport = genSym(nskConst)
         result.add quote do:
@@ -634,11 +650,11 @@ macro importc*(imports: varargs[untyped]): untyped =
     let clangIncludePath = getClangIncludePath()
     if clangIncludePath != "":
       cargs.add newLit("-I" & clangIncludePath)
-  result.add quote do: importcImpl(`defs`, `outputPath`, `cargs`, `files`, `importDirs`, `renames`, `retypes`, RenameCallback(`renameCallback`), OpirCallbacks(`opirCallbacks`), `forwards`)
+  result.add quote do: importcImpl(`defs`, `outputPath`, `cargs`, `files`, `importDirs`, `renames`, `retypes`, RenameCallback(`renameCallback`), OpirCallbacks(`opirCallbacks`), `forwards`, `keepCase`)
 
 proc hash*(n: NimNode): Hash = hash(n.treeRepr)
 
-macro importcImpl*(defs, outputPath: static[string], compilerArguments, files, importDirs: static[openArray[string]], renames, retypes: static[openArray[FromTo]], renameCallback: static[RenameCallback], opirCallbacks: static[OpirCallbacks], forwards: static[openArray[Forward]]): untyped =
+macro importcImpl*(defs, outputPath: static[string], compilerArguments, files, importDirs: static[openArray[string]], renames, retypes: static[openArray[FromTo]], renameCallback: static[RenameCallback], opirCallbacks: static[OpirCallbacks], forwards: static[openArray[Forward]], keepCase: static bool): untyped =
   ## Generate code from C header file. A string, `defs`, containing a header
   ## file with `#include` statements, preprocessor defines and rules, etc. to
   ## be converted is compiled with `compilerArguments` passed directly to clang.
@@ -727,7 +743,8 @@ macro importcImpl*(defs, outputPath: static[string], compilerArguments, files, i
     procs: newStmtList(),
     extraTypes: newStmtList(),
     renameCallback: renameCallback,
-    forwards: forwards.toSeq)
+    forwards: forwards.toSeq,
+    keepCase: keepCase)
 
   # Add explicit field renames
   for rename in renames:
